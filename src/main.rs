@@ -3,7 +3,7 @@
 use dns_lookup::lookup_host;
 
 use std::{
-    io::Error as IoError,
+    io::{Error as IoError, Write},
     net::IpAddr,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -13,12 +13,11 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 struct Ip {
-    address: String,
     hostname: String,
     port: u16,
 
     ping_options: PingOptions,
-    results: Vec<u128>, // list of times it took to get a response, in milliseconds
+    results: Vec<f64>, // list of times it took to get a response, in milliseconds
 }
 
 trait PingOpt {
@@ -73,11 +72,9 @@ impl Ip {
             }
         };
 
-        let hostname = address.to_string();
         Ok(Ip {
-            address: address.to_string(),
+            hostname: address.to_string(),
             port: skim.1,
-            hostname,
             ping_options,
             results: Vec::new(),
         })
@@ -154,24 +151,26 @@ impl Ip {
 
         println!(
             "PING {} ({}) {}({}) bytes of data.",
-            self.hostname,
-            self.address,
-            self.ping_options.packet_size.unwrap_or(56),
-            self.ping_options.packet_size.unwrap_or(56)
+            format!("{}:{}", self.hostname, self.port),
+            self.ping_options.target,
+            self.ping_options.packet_size.unwrap_or(64),
+            self.ping_options.packet_size.unwrap_or(64)
         );
 
-        // ping the tcp address, with 56 bytes of garbage data
+        let addr_port = format!("{}:{}", self.hostname, self.port);
+
+        // ping the tcp address, with 64 bytes of garbage data
         // print whether or not the connection goes through
         // print the time it took to get a response
 
-        let packet_size = self.ping_options.packet_size.unwrap_or(56);
+        let packet_size = self.ping_options.packet_size.unwrap_or(64);
         let count = self.ping_options.count.unwrap_or(0);
         let timeout = self.ping_options.timeout.unwrap_or(4.0);
         let interval = self.ping_options.interval.unwrap_or(1.0);
 
         self.printiv(&format!(
             "TARGET: {}\nPACKET SIZE: {} bytes\nCOUNT: {}\nTIMEOUT: {}s\nINTERVAL: {}s\n",
-            format!("{}:{}", self.address, self.port),
+            format!("{}:{}", self.hostname, self.port),
             packet_size,
             count,
             timeout,
@@ -181,13 +180,14 @@ impl Ip {
         let mut i = 0;
 
         loop {
-            if !running.load(Ordering::SeqCst) { // check after before sleeping (to avoid sleeping when we're done)
+            if !running.load(Ordering::SeqCst) {
+                // check after before sleeping (to avoid sleeping when we're done)
                 break;
             }
             // ping
             let start = std::time::Instant::now();
 
-            let ip_addr = self.address.parse::<IpAddr>();
+            let ip_addr = self.hostname.parse::<IpAddr>();
 
             let ip_addr = match ip_addr {
                 Ok(ip_addr) => ip_addr,
@@ -207,38 +207,37 @@ impl Ip {
                 std::time::Duration::from_secs_f64(timeout),
             );
 
-            let duration = start.elapsed().as_millis();
+            let result = match result {
+                Ok(mut conn) => conn.write(&vec![1; packet_size]),
+                Err(err) => Err(err),
+            };
+
+            let duration = (start.elapsed().as_micros() as f64) / 1000.0;
 
             let failed = result.is_err();
 
-            match result {
-                Ok(_) => {
-                    println!(
-                        "{} bytes from {}: icmp_seq={} time={} ms",
-                        packet_size, self.address, i, duration
-                    );
-                }
-                Err(err) => {
-                    self.printiv(&format!("Error: {}", err));
-                    println!("Request timeout for icmp_seq {}", i);
-                }
-            }
+            print!(
+                "{} bytes to {}: icmp_seq={} time={:.3} ms",
+                packet_size, addr_port, i, duration
+            );
 
-            if (duration as f64) > timeout * 1000.0 && !failed {
-                println!("Request timeout for icmp_seq {}", i);
+            if failed || duration >= timeout * 1000.0 {
+                println!(" (timeout by {:.3}ms)", duration - timeout * 1000.0);
+            } else {
+                println!();
             }
 
             self.results.push(duration);
 
-            if count != 0 && i >= count + 1 {
+            if count != 0 && i >= count - 1 {
                 break;
             }
             i += 1;
 
-            if !running.load(Ordering::SeqCst) { // check once before sleeping
+            if !running.load(Ordering::SeqCst) {
+                // check once before sleeping
                 break;
             }
-
 
             std::thread::sleep(std::time::Duration::from_secs_f64(interval));
         }
@@ -246,18 +245,30 @@ impl Ip {
         println!("\n--- {} ping statistics ---", self.ping_options.target);
 
         // lost packets are ones that took longer than the timeout
-        let lost_packets = self.results.iter().filter(|&&x| x >= ((timeout * 1000.0) as u128)).count();
+        let lost_packets = self
+            .results
+            .iter()
+            .filter(|&&x| x >= timeout * 1000.0)
+            .count();
 
         println!(
-            "{} packets transmitted, {} received, {:.3}% packet loss",
+            "{} packets transmitted, {} received, {:.3}% failed",
             self.results.len(),
-            self.results.iter().filter(|&&x| x > 0).count(),
+            self.results.iter().filter(|&&x| x > 0.0).count(),
             lost_packets as f64 / self.results.len() as f64 * 100.0
         );
         if !self.results.is_empty() {
-            let min = *self.results.iter().min().unwrap();
-            let max = *self.results.iter().max().unwrap();
-            let sum: u128 = self.results.iter().sum();
+            let min = self
+                .results
+                .iter()
+                .min_by(|x, y| x.partial_cmp(y).unwrap())
+                .unwrap();
+            let max = self
+                .results
+                .iter()
+                .max_by(|x, y| x.partial_cmp(y).unwrap())
+                .unwrap();
+            let sum = self.results.iter().sum::<f64>();
             let avg = sum as f64 / self.results.len() as f64;
             let variance = self
                 .results
@@ -268,7 +279,7 @@ impl Ip {
             let stddev = variance.sqrt();
 
             println!(
-                "round-trip min/avg/max/stddev = {}/{:.3}/{}/{:.3} ms",
+                "connection and sending min/avg/max/stddev = {}/{:.3}/{}/{:.3} ms",
                 min, avg, max, stddev
             );
         }
@@ -334,7 +345,7 @@ struct PingOptions {
     #[clap(short, long)]
     timeout: Option<f64>,
 
-    /// The size of the packet to send, in bytes. Default is 56 bytes.
+    /// The size of the packet to send, in bytes. Default is 64 bytes.
     #[clap(short, long)]
     packet_size: Option<usize>,
 
