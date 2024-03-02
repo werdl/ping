@@ -35,6 +35,7 @@ impl Ip {
         };
 
         let hostname = address.to_string();
+        println!("{}:{}", address, skim.1);
         Ok(Ip {
             address: address.to_string(),
             port: skim.1,
@@ -80,6 +81,8 @@ impl Ip {
             None => hostname,
         };
 
+        println!("{}:{}", hostname, port);
+
         (hostname, port)
     }
 
@@ -93,7 +96,7 @@ impl Ip {
 
         let packet_size = self.ping_options.packet_size.unwrap_or(56);
         let count = self.ping_options.count.unwrap_or(4);
-        let timeout = self.ping_options.timeout.unwrap_or(4);
+        let timeout = self.ping_options.timeout.unwrap_or(4.0);
         let interval = self.ping_options.interval.unwrap_or(1.0);
 
         for i in 0..count {
@@ -105,12 +108,14 @@ impl Ip {
                 self.port,
             );
 
+            println!("{}", socket_addr);
+
 
 
             // now wait for the connection to finish, or timeout
             let result = std::net::TcpStream::connect_timeout(
                 &socket_addr,
-                std::time::Duration::from_secs(timeout),
+                std::time::Duration::from_secs_f64(timeout),
             );
 
             let duration = start.elapsed().as_millis();
@@ -126,7 +131,7 @@ impl Ip {
                 }
             }
 
-            if (duration as u64) > timeout * 1000 {
+            if (duration as f64) > timeout * 1000.0 {
                 println!("Request timeout for icmp_seq {}", i);
             }
 
@@ -183,7 +188,7 @@ struct PingOptions {
     count: Option<usize>,
 
     #[clap(short, long)]
-    timeout: Option<u64>,
+    timeout: Option<f64>,
 
     #[clap(short, long)]
     packet_size: Option<usize>,
